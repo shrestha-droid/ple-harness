@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: pi-review-loop
+name: my-harness
 model_api: google-cloud/claude-opus-5-5
 install: >-
   npm ci --prefix {src} --no-fund --no-audit
