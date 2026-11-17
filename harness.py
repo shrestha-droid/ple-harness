@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import pathlib
 import shutil
 import subprocess
@@ -60,6 +61,32 @@ COMPAT = {
     "supportsMidConvoSystemMessages": False,
     "supportsMidConvoToolChanges": False,
 }
+# After pi stops with time to spare, resume the same session for a review
+# round. pi sometimes ends early (a model error, or a turn that just says
+# "let me check X") with deliverables missing; these rounds pick the work up.
+MAX_REVIEW_ROUNDS = 4
+# do not start a review round with less time left than this
+MIN_ROUND_SEC = 900
+DONE_TOKEN = "NO_CHANGES"
+# absolute file paths named in the instruction (deliverables live under these)
+PATH_RE = re.compile(r"(/(?:app|filesystem)/[\w./-]*\.[A-Za-z0-9]{1,5})\b")
+REVIEW = (
+    "{missing}Review round {n}. Re-read the original instruction from the top"
+    " and audit your work against it, item by item, as a checking engineer"
+    " would before sign-off:\n"
+    "1. List every deliverable (file, document, record, tracker or case"
+    " update, email) and every question or decision the instruction asks"
+    " for. Confirm each one exists at the exact path / place and in the exact"
+    " format requested; open or re-read each file you wrote to prove it.\n"
+    "2. Check every number: units, unit conversions, which code clause or"
+    " table it comes from, and that inputs match the project documents.\n"
+    "3. Check every action the instruction asked you to take in a project"
+    " system (tracking, document store, email) was actually performed.\n"
+    "Fix anything missing, wrong or incomplete now, using your tools. If you"
+    " made no change at all, begin your reply with the word " + DONE_TOKEN +
+    ". End your reply with the final summary of what you delivered and where"
+    " (a reviewer reads it), not with a plan of further work."
+)
 # A model pi's catalog does not know gets these limits; tune them for yours.
 UNKNOWN_MODEL = {"input": ["text"], "contextWindow": 128000, "maxTokens": 16384}
 NOTE = (
@@ -166,11 +193,37 @@ def configure(
   return name, model
 
 
+def deliverables(instruction: str) -> list[str]:
+  """Returns the absolute file paths the instruction names under an output dir."""
+  return sorted({
+      p.rstrip(".")
+      for p in PATH_RE.findall(instruction)
+      if "/output/" in p
+  })
+
+
+async def missing_paths(session: taskbridge.Session) -> list[str]:
+  """Returns the instruction's output paths that do not exist in the task container."""
+  paths = deliverables(session.instruction)
+  if not paths:
+    return []
+  quoted = " ".join("'" + p.replace("'", "'\\''") + "'" for p in paths)
+  try:
+    r = await session.exec(
+        f"for p in {quoted}; do [ -s \"$p\" ] || echo \"$p\"; done",
+        timeout_sec=60,
+    )
+  except taskbridge.TaskError:
+    return []
+  return [l for l in r["output"].splitlines() if l.strip()]
+
+
 class Run:
   """Tracks JSON stream events from a single Pi subprocess run."""
 
   def __init__(self, session: taskbridge.Session, model: str):
     self.session, self.model, self.replies = session, model, 0
+    self.last = ""  # last assistant text of the current round
 
   async def on_event(self, event: dict[str, Any]) -> None:
     """Processes a parsed JSON event from Pi, updating final message and usage.
@@ -187,7 +240,7 @@ class Run:
           if b.get("type") == "text"
       )
       if text.strip():
-        self.session.final_message = text.strip()
+        self.session.final_message = self.last = text.strip()
       if message.get("stopReason") == "error":
         await self.session.log(
             f"pi: model error: {message.get('errorMessage')}"
@@ -263,12 +316,15 @@ async def solve(session: taskbridge.Session) -> str:
       name, model = await asyncio.to_thread(
           configure, agent_dir, relay, session, env
       )
-      argv = [
+      base = [
           PI,
           "--print",
           "--mode",
           "json",
-          "--no-session",
+          "--session-dir",
+          str(pathlib.Path(scratch) / "sessions"),
+          "--session-id",
+          "task",
           "-nc",
           "-ns",
           "-np",
@@ -285,16 +341,44 @@ async def solve(session: taskbridge.Session) -> str:
           NOTE.format(workdir=session.workdir),
       ]
       run = Run(session, model)
-      done = await taskbridge.run_process(
-          argv,
-          session,
-          env=env,
-          cwd=str(work),
-          on_line=run.on_line,
-          stdin=session.instruction.encode(),
-          stop_before_sec=STOP_BEFORE_SEC,
-          log_prefix="pi: ",
-      )
+      prompt = session.instruction
+      for n in range(MAX_REVIEW_ROUNDS + 1):
+        run.last = ""
+        done = await taskbridge.run_process(
+            base,
+            session,
+            env=env,
+            cwd=str(work),
+            on_line=run.on_line,
+            stdin=prompt.encode(),
+            stop_before_sec=STOP_BEFORE_SEC,
+            log_prefix="pi: ",
+        )
+        unchanged = run.last.startswith(DONE_TOKEN)
+        if unchanged:
+          # keep the summary, drop the marker the grader shouldn't see
+          clean = run.last[len(DONE_TOKEN):].lstrip(" .:\n")
+          if clean:
+            session.final_message = clean
+        missing = await missing_paths(session)
+        left = session.time_left()
+        await session.log(
+            f"harness: round {n} exit={done.code} stopped={done.stopped}"
+            f" unchanged={unchanged} missing={missing} left={left}"
+        )
+        if done.stopped or (left is not None and left < MIN_ROUND_SEC):
+          break
+        if n and unchanged and not missing:
+          break
+        prompt = REVIEW.format(
+            n=n + 1,
+            missing=(
+                "These deliverable paths named in the instruction do not"
+                f" exist yet: {', '.join(missing)}. Create them.\n\n"
+                if missing
+                else ""
+            ),
+        )
   if not run.replies:
     raise RuntimeError(
         f"pi exited with {done.code} before the model answered:"
